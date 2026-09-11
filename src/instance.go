@@ -15,12 +15,9 @@ type Instance struct {
 	URL   string `json:"url"`
 	Token string `json:"token"`
 
-	// 行为参数。幂等键只有 root，行为参数只在首次启动时生效；
-	// 复用已有实例时用这几个字段兜底告警"本轮参数与运行中实例不一致"。
-	// omitempty 保证旧版本（无这些字段）写入的状态文件仍可正常解析。
-	Host     string `json:"host,omitempty"`
-	Fallback string `json:"fallback,omitempty"`
-	Ignore   string `json:"ignore,omitempty"`
+	// SourceHash 是启动时"监听/编译行为"（watch/exclude/onChangeCommand）的摘要。
+	// 幂等复用时若与本轮 config 不一致，提示重启实例生效。
+	SourceHash string `json:"sourceHash,omitempty"`
 }
 
 func writeInstanceFile(path string, inst Instance) error {

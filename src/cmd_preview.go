@@ -9,8 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"strconv"
-	"strings"
+	"path/filepath"
 	"syscall"
 	"time"
 )
@@ -20,38 +19,38 @@ import (
 // 必须用变量而不是常量：-X 只能注入可变变量的值。
 var version = "dev"
 
+// runPreviewCommand 是 `watchpreview preview` 的唯一入口。
+// 配置只来自 --config 文件；不带 --config 时退化为"当前目录静态预览"。
 func runPreviewCommand(args []string) {
 	fs := flag.NewFlagSet("preview", flag.ExitOnError)
-
-	root := fs.String("root", ".", "预览的根目录")
-	host := fs.String("host", "127.0.0.1", "监听地址；局域网真机预览时可设为 0.0.0.0 或具体网卡 IP")
-	fallback := fs.String("fallback", "none", "静态资源找不到时的回退策略：none | html-suffix | spa")
-	ignore := fs.String("ignore", "", "额外忽略的路径片段，逗号分隔")
-	port := fs.Int("port", 0, "固定端口，0 表示自动分配")
-	open := fs.Bool("open", false, "启动后自动打开浏览器")
-
-	// 内部标记：由本命令自己 spawn 自己时携带，用户不需要手动传。
+	configPath := fs.String("config", "", "配置文件路径；留空则以当前目录为 serveRoot 做纯静态预览")
 	foreground := fs.Bool("foreground", false, "internal: run as the actual server process")
-
 	fs.Parse(args)
 
-	fallbackMode := FallbackMode(*fallback)
-	switch fallbackMode {
-	case FallbackNone, FallbackHTMLSuffix, FallbackSPA:
-	default:
-		fmt.Fprintln(os.Stderr, "watchpreview: invalid --fallback:", *fallback)
-		os.Exit(1)
-	}
-
-	canonical, err := canonicalizeRoot(*root)
+	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "watchpreview:", err)
 		os.Exit(1)
 	}
 
-	info, err := os.Stat(canonical)
-	if err != nil || !info.IsDir() {
-		fmt.Fprintln(os.Stderr, "watchpreview: invalid root:", canonical)
+	if *foreground {
+		runForegroundServer(cfg)
+		return
+	}
+
+	runPreviewWrapper(cfg, *configPath)
+}
+
+// runPreviewWrapper 负责幂等判断 + 拉起后台 server，本身立刻返回。
+// 这是用户/上层框架实际调用的入口：`watchpreview preview [--config <file>]`。
+func runPreviewWrapper(cfg *Config, configPath string) {
+	if configPath == "" {
+		fmt.Fprintln(os.Stderr, "watchpreview: no --config, previewing current directory statically")
+	}
+
+	canonical, err := canonicalizeRoot(cfg.ServeRoot)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "watchpreview:", err)
 		os.Exit(1)
 	}
 
@@ -63,29 +62,15 @@ func runPreviewCommand(args []string) {
 		os.Exit(1)
 	}
 
-	if *foreground {
-		runForegroundServer(canonical, id, instFile, *host, fallbackMode, *ignore, *port)
-		return
-	}
-
-	runPreviewWrapper(canonical, id, instFile, *host, *fallback, *ignore, *port, *open)
-}
-
-// runPreviewWrapper 负责幂等判断 + 拉起后台 server，本身立刻返回。
-// 这是用户/上层框架实际调用的入口：`watchpreview preview --root <dir>`。
-func runPreviewWrapper(canonical, id, instFile, host, fallback, ignore string, port int, open bool) {
 	if existing, ok := readInstanceFile(instFile); ok {
 		if checkInstanceAlive(existing) {
 			// 幂等：已经有一个健康的实例在跑，直接复用。
-			// 幂等键只有 root：行为参数只在首次启动时生效，
-			// 本轮与已有实例不一致时逐条告警，但不中断、照常复用。
-			for _, m := range configMismatches(existing, host, fallback, ignore, port) {
+			// 幂等键只有 serveRoot；监听/编译行为（watch/exclude/
+			// onChangeCommand）本轮与已有实例不一致时告警，但不中断、照常复用。
+			for _, m := range configMismatches(existing, cfg) {
 				fmt.Fprintln(os.Stderr, "watchpreview:", m)
 			}
 			printURL(existing.URL)
-			if open {
-				openBrowser(existing.URL)
-			}
 			return
 		}
 
@@ -101,20 +86,13 @@ func runPreviewWrapper(canonical, id, instFile, host, fallback, ignore string, p
 		os.Exit(1)
 	}
 
-	childArgs := []string{
-		"preview",
-		"--root", canonical,
-		"--host", host,
-		"--fallback", fallback,
-		"--foreground",
-	}
-
-	if ignore != "" {
-		childArgs = append(childArgs, "--ignore", ignore)
-	}
-
-	if port != 0 {
-		childArgs = append(childArgs, "--port", strconv.Itoa(port))
+	childArgs := []string{"preview", "--foreground"}
+	if configPath != "" {
+		abs, err := filepath.Abs(configPath)
+		if err != nil {
+			abs = configPath
+		}
+		childArgs = append(childArgs, "--config", abs)
 	}
 
 	cmd := exec.Command(selfPath, childArgs...)
@@ -132,9 +110,6 @@ func runPreviewWrapper(canonical, id, instFile, host, fallback, ignore string, p
 
 		if inst, ok := readInstanceFile(instFile); ok && inst.PID == cmd.Process.Pid {
 			printURL(inst.URL)
-			if open {
-				openBrowser(inst.URL)
-			}
 			return
 		}
 
@@ -156,7 +131,7 @@ func runPreviewWrapper(canonical, id, instFile, host, fallback, ignore string, p
 // printURL 是 stdout 上唯一允许输出 URL 的出口。
 //
 // 集成契约（上层框架 / AI 消费方依赖它）：
-//  1. 成功调用时 stdout 恰有一行，即预览 URL（http://<host>:<port>/）；
+//  1. 成功调用时 stdout 恰有一行，即预览 URL（http://127.0.0.1:<port>/）；
 //  2. 任何其他信息（运行告警、状态提示、错误原因）只允许走 stderr；
 //  3. --foreground 子进程的 stdout/stderr 已被 exec 接到 null device，
 //     契约输出源只有本进程，这是拾一道约束：不要再往 stdout 写别的内容，
@@ -167,40 +142,52 @@ func printURL(url string) {
 
 // runForegroundServer 是真正长期运行的 HTTP server 进程，
 // 只应该由 runPreviewWrapper 通过 --foreground 拉起，不建议用户直接调用。
-func runForegroundServer(root, id, instFile, host string, fallback FallbackMode, ignoreCSV string, port int) {
+// 监听地址固定 127.0.0.1、端口自动分配。
+func runForegroundServer(cfg *Config) {
 	token := randomToken()
 
-	// 清掉上一次可能的启动错误残留，避免误导本轮诊断。
-	removeStartupError(id)
+	canonical, err := canonicalizeRoot(cfg.ServeRoot)
+	if err != nil {
+		reportStartupError("", err.Error())
+		os.Exit(1)
+	}
+	id := computeID(canonical)
 
-	// 一次性绑定 listener：指定端口被占用、或自动选端口被抢的竞态
-	// 都暴露在这里并立即上报，不再有"先找空闲端口、后绑定"之间的窗口。
-	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", host, port))
+	instFile, err := instanceFilePath(id)
 	if err != nil {
 		reportStartupError(id, err.Error())
 		os.Exit(1)
 	}
-	port = listener.Addr().(*net.TCPAddr).Port
+
+	// 清掉上一次可能的启动错误残留，避免误导本轮诊断。
+	removeStartupError(id)
+
+	// 一次性绑定 listener：自动选端口的竞态暴露在这里并立即上报，
+	// 不再有"先找空闲端口、后绑定"之间的窗口。
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		reportStartupError(id, err.Error())
+		os.Exit(1)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
 
 	hub := NewReloadHub()
-	preview := NewPreview(root, id, token, fallback, hub)
+	preview := NewPreview(canonical, id, token, hub)
 	preview.server = &http.Server{
-		Addr:    fmt.Sprintf("%s:%d", host, port),
+		Addr:    fmt.Sprintf("127.0.0.1:%d", port),
 		Handler: preview.Handler(),
 	}
 
-	url := fmt.Sprintf("http://%s:%d/", host, port)
+	url := fmt.Sprintf("http://127.0.0.1:%d/", port)
 
 	inst := Instance{
-		ID:       id,
-		Root:     root,
-		PID:      os.Getpid(),
-		Port:     port,
-		URL:      url,
-		Token:    token,
-		Host:     host,
-		Fallback: string(fallback),
-		Ignore:   ignoreCSV,
+		ID:         id,
+		Root:       cfg.ServeRoot,
+		PID:        os.Getpid(),
+		Port:       port,
+		URL:        url,
+		Token:      token,
+		SourceHash: cfg.sourceConfigHash(),
 	}
 
 	if err := writeInstanceFile(instFile, inst); err != nil {
@@ -211,15 +198,19 @@ func runForegroundServer(root, id, instFile, host string, fallback FallbackMode,
 	// 状态文件已写出，启动错误文件不再需要。
 	removeStartupError(id)
 
-	var ignore []string
-	if ignoreCSV != "" {
-		ignore = strings.Split(ignoreCSV, ",")
+	// 监听树决定：有 onChangeCommand → 监听 watch（源）；否则 → 监听 serveRoot（纯静态）。
+	roots := []string{cfg.ServeRoot}
+	if cfg.HasOnChange() {
+		if len(cfg.Watch) == 0 {
+			fmt.Fprintln(os.Stderr, "watchpreview: onChangeCommand is set but watch is empty; no source changes will trigger rebuilds")
+		}
+		roots = cfg.Watch
 	}
 
 	watchCtx, cancelWatch := context.WithCancel(context.Background())
 	defer cancelWatch()
 
-	watcher := NewWatcher(root, hub, ignore)
+	watcher := NewWatcher(roots, hub, cfg.Exclude, cfg.OnChangeCommand, cfg.dir)
 
 	go func() {
 		if err := watcher.Run(watchCtx); err != nil {
@@ -237,7 +228,7 @@ func runForegroundServer(root, id, instFile, host string, fallback FallbackMode,
 	}()
 
 	fmt.Println("watchpreview", version)
-	fmt.Println("root:", root)
+	fmt.Println("root:", cfg.ServeRoot)
 	fmt.Println("url:", url)
 
 	sigCtx, stopSig := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -260,32 +251,16 @@ func runForegroundServer(root, id, instFile, host string, fallback FallbackMode,
 	fmt.Println("watchpreview: stopped")
 }
 
-// configMismatches 对比已有实例与本轮调用的行为参数，返回不一致的告警描述。
+// configMismatches 对比已有实例与本轮 config 的监听/编译行为。
 //
-// 幂等键只有 root：--host/--port/--fallback/--ignore 只在首次启动时生效，
-// 复用已有实例时这些参数会被忽略。这里只做可观察性提示，不改变复用行为。
-//
-// 两个宽容规则，避免误报：
-//   - 请求 port == 0 表示"自动分配/无要求"，不构成明确意图，不做比对；
-//   - 已有实例的 host/fallback/ignore 为空（旧版本写入的状态文件缺这些字段），
-//     无法还原当时的配置意图，跳过比对该项。
-func configMismatches(inst Instance, host, fallback, ignore string, port int) []string {
+// 幂等键只有 serveRoot。watch/exclude/onChangeCommand 属监听/编译行为，
+// 变更不重建实例（避免热切换监听树的不确定性），比对基于实例记录的
+// 行为摘要（sourceHash），不一致时提示重启实例生效。
+func configMismatches(inst Instance, cfg *Config) []string {
 	var msgs []string
 
-	if inst.Host != "" && inst.Host != host {
-		msgs = append(msgs, fmt.Sprintf("instance already running on host %s, ignoring --host %s", inst.Host, host))
-	}
-
-	if port != 0 && inst.Port != port {
-		msgs = append(msgs, fmt.Sprintf("instance already running on port %d, ignoring --port %d", inst.Port, port))
-	}
-
-	if inst.Fallback != "" && inst.Fallback != fallback {
-		msgs = append(msgs, fmt.Sprintf("instance already running with fallback %q, ignoring --fallback %q", inst.Fallback, fallback))
-	}
-
-	if inst.Ignore != "" && inst.Ignore != ignore {
-		msgs = append(msgs, fmt.Sprintf("instance already running with ignore %q, ignoring --ignore %q", inst.Ignore, ignore))
+	if inst.SourceHash != "" && inst.SourceHash != cfg.sourceConfigHash() {
+		msgs = append(msgs, "watch/exclude/onChangeCommand differs from the running instance; run 'stop' then 'preview' again to apply")
 	}
 
 	return msgs

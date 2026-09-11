@@ -19,19 +19,10 @@ const (
 	statusEndpointPath = "/_watchpreview/control/status"
 )
 
-type FallbackMode string
-
-const (
-	FallbackNone       FallbackMode = "none"
-	FallbackHTMLSuffix FallbackMode = "html-suffix"
-	FallbackSPA        FallbackMode = "spa"
-)
-
 type Preview struct {
-	root     string
-	id       string
-	token    string
-	fallback FallbackMode
+	root  string
+	id    string
+	token string
 
 	reload *ReloadHub
 	server *http.Server
@@ -40,14 +31,13 @@ type Preview struct {
 	doneOnce sync.Once
 }
 
-func NewPreview(root, id, token string, fallback FallbackMode, hub *ReloadHub) *Preview {
+func NewPreview(root, id, token string, hub *ReloadHub) *Preview {
 	return &Preview{
-		root:     root,
-		id:       id,
-		token:    token,
-		fallback: fallback,
-		reload:   hub,
-		done:     make(chan struct{}),
+		root:   root,
+		id:     id,
+		token:  token,
+		reload: hub,
+		done:   make(chan struct{}),
 	}
 }
 
@@ -171,20 +161,6 @@ func (p *Preview) resolveFile(fileAbs string) (string, bool) {
 		}
 	} else if err == nil {
 		return fileAbs, true
-	}
-
-	switch p.fallback {
-	case FallbackHTMLSuffix:
-		htmlPath := fileAbs + ".html"
-		if _, err := os.Stat(htmlPath); err == nil {
-			return htmlPath, true
-		}
-
-	case FallbackSPA:
-		indexPath := filepath.Join(p.root, "index.html")
-		if _, err := os.Stat(indexPath); err == nil {
-			return indexPath, true
-		}
 	}
 
 	return "", false

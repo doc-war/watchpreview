@@ -6,12 +6,15 @@ import (
 )
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `watchpreview - 通用静态预览 + 自动刷新守护进程
+	fmt.Fprintln(os.Stderr, `watchpreview - 静态预览 + 源码监听编译刷新守护进程
 
 用法:
-  watchpreview preview [--root .] [--host 127.0.0.1] [--fallback none|html-suffix|spa] [--ignore a,b] [--port 0] [--open]
-  watchpreview stop    [--root .]
-  watchpreview status  [--root .]`)
+  watchpreview preview [--config <file>]
+  watchpreview stop    [--config <file>]
+  watchpreview status  [--config <file>]
+
+配置（JSON）: serveRoot（必填）、watch、exclude、onChangeCommand。
+不带 --config 则预览当前目录（纯静态）。`)
 }
 
 func main() {

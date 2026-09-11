@@ -9,10 +9,18 @@ import (
 
 func runStatusCommand(args []string) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
-	root := fs.String("root", ".", "预览的根目录")
+	configPath := fs.String("config", "", "配置文件路径；留空则以当前目录定位实例")
 	fs.Parse(args)
 
-	canonical, err := canonicalizeRoot(*root)
+	// 与 preview 完全对称：定位实例的幂等键是 serveRoot，
+	// 它来自 --config 文件或"当前工作目录"的隐式默认配置。
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "watchpreview:", err)
+		os.Exit(1)
+	}
+
+	canonical, err := canonicalizeRoot(cfg.ServeRoot)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "watchpreview:", err)
 		os.Exit(1)

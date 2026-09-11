@@ -1,147 +1,115 @@
 # watchpreview
 
-一个与前端框架无关的基础设施二进制：
+一个进程，接管前端开发中最繁琐的链路：
 
-**静态文件服务 + 文件变化监听 + 浏览器自动刷新 + 单实例幂等管理**。
+```
+源码 (watch) ──变更──▶ 编译 (onChangeCommand) ──成功──▶ dist (serveRoot) ───▶ 浏览器实时预览
+      自动                      自动                          自动刷新（SSE）
+```
 
-它不知道、也不关心内容是怎么产生的——手写静态 HTML、Vue/webpack 编译出的 dist、还是某个框架的母版渲染产物都一样。核心契约只有一句话：**给定一个目录，把它当静态站点 serve 出去，目录里的文件变了就通知浏览器刷新。**
-
-所有生命周期管理（幂等判断、id 计算、状态文件、优雅停止）都在二进制内部完成，上层框架只需要 `spawn` 这一个命令、读 stdout 拿 URL，不需要自己维护 instance.json。
+**框架只需 spawn 一个命令、读 stdout 拿 URL。** 不需要自己监听源码、触发编译、起 dist 服务、通知浏览器刷新——整条链路由一份 JSON 配置委托给 watchpreview 接管。
 
 ---
 
 ## 快速使用
 
 ```bash
-watchpreview preview --root dist
-# → 打印 URL，立即返回（不阻塞终端）
-# http://127.0.0.1:54231/
+# 零配置：以当前目录为静态服务并监听变化
+cd dist && watchpreview preview
+# → http://127.0.0.1:54231/
 
-watchpreview preview --root dist
-# → 再次执行，识别到已有健康实例，直接复用同一个 URL
+# 静态预览（只 serve 某个目录）
+# config.json: { "serveRoot": "dist" }
+watchpreview preview --config config.json
 
-watchpreview status --root dist
-watchpreview stop --root dist
-watchpreview --version                   # 打印版本号（发布版如 v1.0.0，本地构建为 dev）
+# 委托编译：源码变 → build → dist 自动刷新
+# config.json: { "serveRoot": "dist", "watch": ["src"], "onChangeCommand": "npm run build" }
+watchpreview preview --config config.json
+
+# 幂等 / 生命周期（不带 --config 按当前目录定位）
+watchpreview status  --config config.json
+watchpreview stop    --config config.json
+watchpreview --version
 ```
 
-对上层框架来说，集成方式就是：
+集成示例（TS）：
 
 ```ts
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-const execFileAsync = promisify(execFile);
-
-let stdout: string;
-try {
-  ({ stdout } = await execFileAsync("watchpreview", ["preview", "--root", "dist"]));
-} catch (err) {
-  // 失败时保持非零退出码，真实原因在 stderr（由内部 .err 诊断文件转述，不会丢）
-  throw new Error(`preview failed: ${(err as Error & { stderr?: string }).stderr}`);
-}
-const url = stdout.split(/\r?\n/).find((l) => l.trim())?.trim(); // 契约：首行即 URL
+const { stdout } = await execFileAsync("watchpreview", ["preview", "--config", wpPath]);
+const url = stdout.split(/\r?\n/).find(l => l.trim())?.trim(); // 契约：首行即 URL
 ```
-
-不需要再自己算 hash、读写 JSON、管理 detached 进程——这些都在二进制内部完成了。
 
 ---
 
-## 集成契约（上层开发 / AI 消费方必读）
+## 配置
 
-`watchpreview preview --root <dir>` 的 stdout/stderr/退出码有**严格约定**，请按此实现：
+JSON 文件，`--config <file>` 传入。所有路径**相对 config 所在目录**（也接受绝对路径）。
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `serveRoot` | 是 | 被服务的 dist 目录（幂等键）；缺省 `--config` 时为当前工作目录 |
+| `watch` | 否 | 源码监听根，可多个，递归；有 `onChangeCommand` 时生效 |
+| `exclude` | 否 | 路径前缀过滤，作用于当前监听树；内置忽略 `.git`、`node_modules`、点开头目录 |
+| `onChangeCommand` | 否 | 编译命令，非空即启用"源变→编译→刷新"管道；由平台 shell 执行（`cmd /C` / `sh -c`） |
+
+```json
+{ "serveRoot": "dist", "watch": ["src"], "exclude": [".tmp"], "onChangeCommand": "npm run build" }
+```
+
+两种形态：
+
+| 形态 | 监听树 | 变化后行为 |
+|---|---|---|
+| 有 `onChangeCommand` | `watch` | 防抖 1s → 执行命令（超时 60s）→ **成功才刷新**；失败不刷新，保留旧页 |
+| 无（含零配置） | `serveRoot` | 防抖 1s → 直接刷新 |
+
+编译命令工作目录固定为 config 文件所在目录。命令成功（exit 0）→ 刷新；失败/超时 → stderr 报错，页面不动。
+
+---
+
+## 集成契约
+
+`watchpreview preview [--config <file>]` 的 stdout/stderr/退出码：
 
 | 场景 | exit code | stdout | stderr |
 |---|---|---|---|
-| 启动成功（含幂等复用） | `0` | **恰一行**，即预览 URL `http://<host>:<port>/` | 没有；若本轮参数与运行中实例不一致会有告警 |
-| 启动失败（端口占用、root 无效等） | 非 `0` | 无可用内容 | 失败原因（由内部 `.err` 诊断文件转述，保证不丢） |
-| 运行期信息（陈旧清理提示、参数告警） | — | 无 | 有 |
+| 启动成功 / 幂等复用 | `0` | **恰一行**：`http://127.0.0.1:<port>/` | 无；监听/编译行为变更时有告警 |
+| 启动失败 | 非 `0` | 无 | 失败原因（`.err` 文件转述，不丢） |
 
-三条硬规则：
+硬规则：
 
-1. **stdout 只有那一个 URL 行**。其余一切（告警、提示、错误）都走 stderr，永远是 UTF-8 文本、以换行结尾。若 stdout 解析不到 URL 行，按失败处理。
-2. **每次调用以本次 stdout 为准**。自动端口下 URL 可能每次不同；同 `--root` 二次调用则一定复用同一个 URL（幂等），不要自己缓存或用之前的值。
+1. **stdout 只有那一行 URL**；其余一切走 stderr。
+2. **每次以本次 stdout 为准**；同 `serveRoot` 二次调用一定复用同一 URL（幂等）。
+3. **失败 ≠ 重试信号**；非零即失败；陈旧状态自动重启属正常自愈。
+4. **不带 `--config` = 当前目录纯静态**，stderr 有提示（不算错误）。
+5. **同一 serveRoot 只维护一个实例**，多进程场景需自行串行化调用。
 
-### 上层集成容易踩的边界
-
-- **换行是平台相关的**：Windows 上是 `\r\n`。用 `trim()` 或按 `/\r?\n/` 分行，不要直接 `split('\n')`（会残留 `\r`）。
-- **`--host 0.0.0.0` 打印的 URL 是 `http://0.0.0.0:...`**：该字面值在真机/其他设备上不可达，真机预览需自行替换为机器局域网 IP。
-- **行为参数只在首次启动生效**：`--port`/`--host`/`--fallback`/`--ignore` 不会重建实例；后调与运行中实例不一致时只有 stderr 告警，URL 照旧。
-- **失败不是重试信号**：非零退出即失败；"陈旧状态下次调用自动重启"是正常自愈，不在失败语义里。
-- **同一个 root 同时只维护一个实例**：多个框架进程同时 `preview` 同一 root 时不保证串行安全，多进程/集群场景需自行串行化调用。
-
-改动二进制或需了解内部机制、回归验证方式（契约守卫测试），见根目录 `设计.md`；IDE/Copilot 集成速查见 `skill/watchpreview/SKILL.md`。上层消费方不需要这些细节。
+Windows 上换行是 `\r\n`，按 `/\r?\n/` 分行。
 
 ---
 
 ## 子命令
 
-### `watchpreview preview`
+| 命令 | 说明 |
+|---|---|
+| `preview [--config <file>]` | 启动或复用实例，stdout 输出 URL，命令本身立刻返回 |
+| `stop [--config <file>]` | 优雅停止（HTTP 端点）；失败则降级清理（见 `设计.md`） |
+| `status [--config <file>]` | 打印实例 JSON 或 `preview is not running` |
 
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `--root` | `.` | 预览根目录 |
-| `--host` | `127.0.0.1` | 监听地址；局域网真机预览设为 `0.0.0.0` 或具体网卡 IP |
-| `--fallback` | `none` | `none` \| `html-suffix` \| `spa`，见下方说明 |
-| `--ignore` | 空 | 额外忽略的路径片段，逗号分隔 |
-| `--port` | `0`（自动） | 固定端口时使用，一般不需要设置 |
-| `--open` | `false` | 启动后自动打开浏览器 |
-
-**幂等语义**：同一个 `--root`（规范化之后）第二次调用会复用已有实例，直接打印同一个 URL，不会重复启动。命令本身立刻返回——真正的 HTTP server 是它 fork 出的一个 detached 子进程，不占用调用方的终端/子进程句柄。
-
-注意 `--host`/`--port`/`--fallback`/`--ignore` **只在首次启动时生效**：幂等键只有 `--root`，后调参数不构成新实例。若后调参数与运行中的实例不一致，会向 stderr 打印一条告警（例如 `instance already running on port 8080, ignoring --port 8081`），但仍照常复用已有实例。`--port 0`（自动分配）不参与比对，不指定端口不会产生告警。
-
-### `--fallback` 取值（唯一需要框架自行选择的行为差异点）
-
-- `none`：找不到文件就是 404。纯静态目录预览用这个。
-- `html-suffix`：`/foo` 找不到时尝试 `/foo.html`。适合"路由即文件名"约定的框架（比如 ds）。
-- `spa`：找不到任何静态文件时回退到根目录 `index.html`。适合 Vue Router / React Router 这类客户端路由。
-
-### `watchpreview stop --root <dir>`
-
-优先通过 HTTP 控制端点优雅停止（关 server、停 watcher、删状态文件）。如果联系不上，走陈旧状态的降级路径（见 `设计.md`）。
-
-### `watchpreview status --root <dir>`
-
-打印当前实例信息（不含 token），或 `preview is not running`。
-
----
-
-## 安全提示
-
-- 默认只监听 `127.0.0.1`；`--host 0.0.0.0` 仅用于可信局域网真机预览，且打印的字面 URL 真机不可达，需替换为局域网 IP。
-- 内部机制（陈旧状态降级、HTTP 控制端点、构建、升级）与改动二进制后的回归验证，见根目录 `设计.md`。
+幂等键是 `serveRoot`（规范化后）。行为参数（`watch`/`exclude`/`onChangeCommand`）变更时不重建实例，stderr 会提示重启生效。
 
 ---
 
 ## 发布流程
 
-仓库通过 Git Tag + GitHub Actions 自动发布，**不需要手动去 GitHub 网页创建 Release**。
-
-**平时开发**（只跑 CI，不产生 Release）：
-
 ```bash
-git add .
-git commit -m "feat: xxx"
-git push origin main
+git tag v1.1.0 && git push origin v1.1.0   # 自动触发 GitHub Actions 发布
 ```
 
-CI 会执行 `go test ./...` 与 `go vet ./...`。
+CI 平时跑 `go test` / `go vet`；发版时 goreleaser 跨平台编译（linux/darwin/windows × amd64/arm64，`CGO_ENABLED=0`）挂载到 GitHub Release，自动附 `checksums.txt`。
 
-**发版**：
+预发布标签（如 `v1.1.0-rc1`）自动标记为 Prerelease。
 
-```bash
-git tag v1.0.0
-git push origin v1.0.0
-```
+---
 
-推送后 GitHub Actions 自动完成：跨平台编译（linux / darwin / windows × amd64 / arm64，`CGO_ENABLED=0` 静态链接）、创建 GitHub Release、挂载各平台压缩包（非 Windows 为 `.tar.gz`，Windows 为 `.zip`）与 `checksums.txt`，Release 标题即为 `v1.0.0`。
-
-> 注意：`git push` **默认不推标签**，必须显式 `git push origin v<tag>` 才会触发发布。
-
-**语义化版本（SemVer）建议**：
-
-- **主版本**：破坏性变更——集成契约变化（stdout/stderr/退出码语义改变）、不向后兼容的行为调整。
-- **次版本**：向后兼容的新增能力（新参数、新子命令、新 fallback 等），旧集成方式无需改动。
-- **修订**：bug 修复、文档、内部实现优化，集成方式不变。
-
-若在开发中打预发布标签（如 `v1.1.0-rc1`），对应 Release 会被**自动标记为 Prerelease**，不会展示为正式版本。
+内部机制、回归验证方式见 `设计.md`；AI/Copilot 速查见 `skill/watchpreview/SKILL.md`。
