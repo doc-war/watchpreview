@@ -79,7 +79,7 @@ func runPreviewWrapper(canonical, id, instFile, host, fallback, ignore string, p
 			for _, m := range configMismatches(existing, host, fallback, ignore, port) {
 				fmt.Fprintln(os.Stderr, "watchpreview:", m)
 			}
-			fmt.Println(existing.URL)
+			printURL(existing.URL)
 			if open {
 				openBrowser(existing.URL)
 			}
@@ -128,7 +128,7 @@ func runPreviewWrapper(canonical, id, instFile, host, fallback, ignore string, p
 		time.Sleep(100 * time.Millisecond)
 
 		if inst, ok := readInstanceFile(instFile); ok && inst.PID == cmd.Process.Pid {
-			fmt.Println(inst.URL)
+			printURL(inst.URL)
 			if open {
 				openBrowser(inst.URL)
 			}
@@ -148,6 +148,18 @@ func runPreviewWrapper(canonical, id, instFile, host, fallback, ignore string, p
 
 	fmt.Fprintln(os.Stderr, "watchpreview: timeout waiting for server to start")
 	os.Exit(1)
+}
+
+// printURL 是 stdout 上唯一允许输出 URL 的出口。
+//
+// 集成契约（上层框架 / AI 消费方依赖它）：
+//  1. 成功调用时 stdout 恰有一行，即预览 URL（http://<host>:<port>/）；
+//  2. 任何其他信息（运行告警、状态提示、错误原因）只允许走 stderr；
+//  3. --foreground 子进程的 stdout/stderr 已被 exec 接到 null device，
+//     契约输出源只有本进程，这是拾一道约束：不要再往 stdout 写别的内容，
+//     否则会静默破坏消费方的 `stdout 第一行 = URL` 约定。
+func printURL(url string) {
+	fmt.Println(url)
 }
 
 // runForegroundServer 是真正长期运行的 HTTP server 进程，

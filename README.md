@@ -27,11 +27,48 @@ watchpreview stop --root dist
 对上层框架来说，集成方式就是：
 
 ```ts
-const { stdout } = await execFileAsync("watchpreview", ["preview", "--root", "dist"]);
-const url = stdout.trim(); // 最后一行就是 URL
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+const execFileAsync = promisify(execFile);
+
+let stdout: string;
+try {
+  ({ stdout } = await execFileAsync("watchpreview", ["preview", "--root", "dist"]));
+} catch (err) {
+  // 失败时保持非零退出码，真实原因在 stderr（由内部 .err 诊断文件转述，不会丢）
+  throw new Error(`preview failed: ${(err as Error & { stderr?: string }).stderr}`);
+}
+const url = stdout.split(/\r?\n/).find((l) => l.trim())?.trim(); // 契约：首行即 URL
 ```
 
 不需要再自己算 hash、读写 JSON、管理 detached 进程——这些都在二进制内部完成了。
+
+---
+
+## 集成契约（上层开发 / AI 消费方必读）
+
+`watchpreview preview --root <dir>` 的 stdout/stderr/退出码有**严格约定**，请按此实现：
+
+| 场景 | exit code | stdout | stderr |
+|---|---|---|---|
+| 启动成功（含幂等复用） | `0` | **恰一行**，即预览 URL `http://<host>:<port>/` | 没有；若本轮参数与运行中实例不一致会有告警 |
+| 启动失败（端口占用、root 无效等） | 非 `0` | 无可用内容 | 失败原因（由内部 `.err` 诊断文件转述，保证不丢） |
+| 运行期信息（陈旧清理提示、参数告警） | — | 无 | 有 |
+
+三条硬规则：
+
+1. **stdout 只有那一个 URL 行**。其余一切（告警、提示、错误）都走 stderr，永远是 UTF-8 文本、以换行结尾。若 stdout 解析不到 URL 行，按失败处理。
+2. **每次调用以本次 stdout 为准**。自动端口下 URL 可能每次不同；同 `--root` 二次调用则一定复用同一个 URL（幂等），不要自己缓存或用之前的值。
+
+### 上层集成容易踩的边界
+
+- **换行是平台相关的**：Windows 上是 `\r\n`。用 `trim()` 或按 `/\r?\n/` 分行，不要直接 `split('\n')`（会残留 `\r`）。
+- **`--host 0.0.0.0` 打印的 URL 是 `http://0.0.0.0:...`**：该字面值在真机/其他设备上不可达，真机预览需自行替换为机器局域网 IP。
+- **行为参数只在首次启动生效**：`--port`/`--host`/`--fallback`/`--ignore` 不会重建实例；后调与运行中实例不一致时只有 stderr 告警，URL 照旧。
+- **失败不是重试信号**：非零退出即失败；"陈旧状态下次调用自动重启"是正常自愈，不在失败语义里。
+- **同一个 root 同时只维护一个实例**：多个框架进程同时 `preview` 同一 root 时不保证串行安全，多进程/集群场景需自行串行化调用。
+
+改动二进制或需了解内部机制、回归验证方式（契约守卫测试），见根目录 `设计.md`；IDE/Copilot 集成速查见 `skill/watchpreview/SKILL.md`。上层消费方不需要这些细节。
 
 ---
 
@@ -60,7 +97,7 @@ const url = stdout.trim(); // 最后一行就是 URL
 
 ### `watchpreview stop --root <dir>`
 
-优先通过 HTTP 控制端点优雅停止（关 server、停 watcher、删状态文件）。如果联系不上（见下方"陈旧状态"），走降级路径。
+优先通过 HTTP 控制端点优雅停止（关 server、停 watcher、删状态文件）。如果联系不上，走陈旧状态的降级路径（见 `设计.md`）。
 
 ### `watchpreview status --root <dir>`
 
@@ -68,75 +105,7 @@ const url = stdout.trim(); // 最后一行就是 URL
 
 ---
 
-## 陈旧状态（stale instance）的降级容错
+## 安全提示
 
-状态文件存放在平台惯用的用户级缓存目录下（无需提权、各平台都可写），路径为 `<缓存目录>/watchpreview/<id>.json`：
-
-| 平台 | 实际位置 |
-|---|---|
-| Windows | `%LOCALAPPDATA%\watchpreview\<id>.json` |
-| macOS | `~/Library/Caches/watchpreview/<id>.json`（可能被系统清理，但这相当于"陈旧状态"，下次 preview 会自动重启） |
-| Linux | `$XDG_CACHE_HOME`（默认 `~/.cache`）下的 `watchpreview/<id>.json` |
-
-这个状态文件的存在，**不代表对应实例真的还活着**。会变成陈旧状态的典型场景：
-
-1. **进程被 `kill -9` 或主机断电**：来不及清理状态文件，PID 已经不存在了。
-2. **PID 被操作系统回收，复用给了另一个无关进程**：容器/CI 环境里这个概率不低，如果只查"PID 是否存在"会误判成"还活着"，返回一个实际已经失效的旧 URL。
-3. **进程还在，但 HTTP server 已经挂死**（死锁、崩溃后残留僵尸线程等）：PID 检查过不了这种情况。
-
-### 判断策略：两层校验都过才算真的活着
-
-```
-checkInstanceAlive(inst):
-    1. pidAlive(inst.PID) == false  → 直接判定陈旧
-    2. GET {inst.URL}/_watchpreview/control/status，800ms 超时
-       - 请求失败/超时           → 判定陈旧（进程可能挂死）
-       - 返回的 id/root 对不上   → 判定陈旧（PID 被复用给了别的进程）
-    3. 两层都过 → 判定存活
-```
-
-### 各命令的降级行为
-
-| 命令 | 发现陈旧状态时的行为 |
-|---|---|
-| `preview` | 静默清理状态文件，直接重新启动一个新实例，用户无感 |
-| `status` | 清理状态文件，报告 `preview is not running` |
-| `stop` | 优雅停止（HTTP）失败后：若 PID 存活**且能通过 HTTP 控制端点核对 id/root 确认身份**，则强制终止；若 PID 存活但核对不上（很可能是 PID 被系统回收、复用给了别的进程），**不杀 PID**，只清理状态文件并提示手动确认；若 PID 已不存在则只清理状态文件。两种情况最终都报告 `preview stopped` |
-
-### 已知的边界情况（未处理，设计上刻意从简）
-
-- **并发 race**：两个 `watchpreview preview --root x` 在极短时间内同时执行，都可能判断"没有活实例"并各自拉起一个 server。作为本地开发工具（单用户、命令通常顺序执行），这个概率很低，代价也可控（浪费一个端口 + 一个孤儿进程，可用 `stop` 手动清理）。如果未来要用在并发调用频繁的场景（比如多个 CI job 并行跑同一目录），需要在 `instanceFilePath` 写入前加文件锁（`O_CREATE|O_EXCL`）。
-- **挂死进程只能部分回收**：`stop` 只会在"HTTP 控制端点能核对上身份"时才强制终止（`SIGTERM`，Windows 是 `taskkill /F`）；若进程挂死到连控制端点都不响应，无法确认那个 PID 到底还是不是本实例，**为避免误杀 PID 被复用后的无关进程，选择不杀**，仅清理状态文件并在 stderr 提示手动确认。
-
-### 从旧版升级
-
-- **v1.0.0**：状态文件 schema 新增 `host`/`fallback`/`ignore` 字段（`omitempty`），旧状态文件仍可正常解析；复用时不会对旧文件缺失的字段做比对，升级后首次调用无告警。
-- **v0.2.0 起**：状态目录从 `~/.watchpreview/preview/` 迁移到平台缓存目录（见上文）。旧状态文件不再读取：已启动的旧版本实例会变成孤儿（端口仍占用、无法再用 `stop` 定位），升级后请手动结束残留进程，并可删除旧的 `~/.watchpreview` 目录。
-
----
-
-## HTTP 端点（内部使用，一般不需要框架层直接调用）
-
-| 路径 | 方法 | 鉴权 |
-|---|---|---|
-| `/_watchpreview/reload` | GET | 无（SSE） |
-| `/_watchpreview/control/stop` | POST | `X-WatchPreview-Token` header |
-| `/_watchpreview/control/status` | GET | 无（仅返回 id/root，用于陈旧状态核对） |
-
----
-
-## 构建
-
-```bash
-go build -o dist/watchpreview-<os>-<arch> ./src
-```
-
-按目标平台交叉编译，产物命名建议 `watchpreview-{GOOS}-{GOARCH}[.exe]`，上层工具运行时根据 `process.platform`/`process.arch` 选择对应二进制。仓库已提交 `go.sum`，全新 clone 后无需额外步骤即可构建。
-
----
-
-## 安全说明
-
-- 默认只监听 `127.0.0.1`；改成 `0.0.0.0` 前确认是在可信网络环境（比如自己的局域网做真机预览）。
-- `/control/stop` 需要 token（每次启动随机生成，存在状态文件里，只有本机能读到）；`/control/status` 不需要，因为只暴露非敏感的 id/root。
-- 静态文件服务做了路径越界校验，`../` 无法逃出 `root`。
+- 默认只监听 `127.0.0.1`；`--host 0.0.0.0` 仅用于可信局域网真机预览，且打印的字面 URL 真机不可达，需替换为局域网 IP。
+- 内部机制（陈旧状态降级、HTTP 控制端点、构建、升级）与改动二进制后的回归验证，见根目录 `设计.md`。

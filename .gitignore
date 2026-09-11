@@ -1,0 +1,12 @@
+# build outputs
+dist/
+.build/
+
+# node
+node_modules/
+
+# editor / os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
