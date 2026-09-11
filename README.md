@@ -14,8 +14,12 @@
 ## 快速使用
 
 ```bash
+# 零配置零参数：以当前目录为静态服务并监听变化，相当于watchpreview preview
+watchpreview
+# → http://127.0.0.1:54231/
+
 # 零配置：以当前目录为静态服务并监听变化
-cd dist && watchpreview preview
+watchpreview preview
 # → http://127.0.0.1:54231/
 
 # 静态预览（只 serve 某个目录）
@@ -50,8 +54,9 @@ JSON 文件，`--config <file>` 传入。所有路径**相对 config 所在目�
 | `serveRoot` | 是 | 被服务的 dist 目录（幂等键）；缺省 `--config` 时为当前工作目录 |
 | `watch` | 否 | 源码监听根，可多个，递归；有 `onChangeCommand` 时生效 |
 | `exclude` | 否 | 路径前缀过滤，作用于当前监听树；内置忽略 `.git`、`node_modules`、点开头目录 |
-| `onChangeCommand` | 否 | 编译命令，非空即启用"源变→编译→刷新"管道；由平台 shell 执行（`cmd /C` / `sh -c`） |
+| `onChangeCommand` | 否 | 编译命令，非空即启用"源变→编译→刷新"管道；执行细节见下 |
 
+示例
 ```json
 { "serveRoot": "dist", "watch": ["src"], "exclude": [".tmp"], "onChangeCommand": "npm run build" }
 ```
@@ -64,6 +69,14 @@ JSON 文件，`--config <file>` 传入。所有路径**相对 config 所在目�
 | 无（含零配置） | `serveRoot` | 防抖 1s → 直接刷新 |
 
 编译命令工作目录固定为 config 文件所在目录。命令成功（exit 0）→ 刷新；失败/超时 → stderr 报错，页面不动。
+
+**`onChangeCommand` 执行方式**（Windows）：watchpreview 会把整条命令**原样写入临时 `.cmd` 脚本**、在**隐藏窗口**中执行、跑完即删。因此：
+
+- 命令里的**引号、中文路径**都正确解析（无需自己包一层批处理或 `chcp`，框架已内置 `chcp 65001`）；
+- git 仓库里不会出现命令痕迹，编译不会闪出 cmd 窗口；
+- 命令语义与在 cmd 里手敲一致，可用 `&&`、重定向等。
+
+macOS/Linux 直接以 `sh -c` 执行，行为不变。
 
 ---
 

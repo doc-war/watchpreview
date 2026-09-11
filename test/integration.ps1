@@ -205,6 +205,55 @@ Assert "hash: stop works" ($h_stop.Output -match 'stopped')
 $h5 = Invoke-WP @("status", "--config", $cfgHash)
 Assert "hash: after stop, not running" ($h5.Output -match 'not running')
 
+# ==== Part 6: quoted paths in onChangeCommand (坑1: cmd /C + Go \" escaping) ====
+# 旧实现直接 `cmd /C <命令>`，Go 会把引号转成 \"，cmd 不认反斜杠引号，
+# 含引号路径的命令必然失败。修复后命令原样写入临时批处理，应能成功。
+Write-Host "`n--- Part 6: quoted path in onChangeCommand ---"
+$qqDir    = Join-Path $work "qq dir"
+New-Item -ItemType Directory -Path $qqDir | Out-Null
+$qMarker  = Join-Path $qqDir "q.marker"
+$trigQ    = Join-Path $src "trigger-q.txt"
+
+$cfgQ = Join-Path $cfg "quote.json"
+Expand-Config -Obj @{
+    serveRoot       = $live
+    watch           = @($src)
+    onChangeCommand = "cmd /c type NUL > `"$qMarker`""
+} -Path $cfgQ
+
+$q1 = Invoke-WP @("preview", "--config", $cfgQ)
+Assert "quote: preview exit 0" ($q1.ExitCode -eq 0)
+Start-Sleep -Milliseconds 500
+Set-Content -LiteralPath $trigQ -Value "q" -Encoding Ascii
+Assert "quote: oncompiled command with quoted path triggers marker" (Wait-For -Path $qMarker -TimeoutMs 5000)
+$q_stop = Invoke-WP @("stop", "--config", $cfgQ)
+Assert "quote: stop works" ($q_stop.Output -match 'stopped')
+
+# ==== Part 7: CJK path in onChangeCommand (坑2: UTF-8 vs cmd ANSI/GBK) ====
+# cmd 读批处理默认按 ANSI(GBK)，命令里 UTF-8 中文路径会乱码；
+# watchpreview 写临时脚本首行放 chcp 65001，命令中的中文应正确解析。
+Write-Host "`n--- Part 7: CJK path in onChangeCommand ---"
+$cjkName  = [string][char]0x4E2D + [string][char]0x6587   # 中文
+$cjkDir   = Join-Path $work $cjkName
+New-Item -ItemType Directory -Path $cjkDir | Out-Null
+$cMarker  = Join-Path $cjkDir "c.marker"
+$trigC    = Join-Path $src "trigger-c.txt"
+
+$cfgC = Join-Path $cfg "cjk.json"
+Expand-Config -Obj @{
+    serveRoot       = $live
+    watch           = @($src)
+    onChangeCommand = "cmd /c type NUL > `"$cMarker`""
+} -Path $cfgC
+
+$c1 = Invoke-WP @("preview", "--config", $cfgC)
+Assert "cjk: preview exit 0" ($c1.ExitCode -eq 0)
+Start-Sleep -Milliseconds 500
+Set-Content -LiteralPath $trigC -Value "c" -Encoding Ascii
+Assert "cjk: oncompiled command with CJK path triggers marker" (Wait-For -Path $cMarker -TimeoutMs 5000)
+$c_stop = Invoke-WP @("stop", "--config", $cfgC)
+Assert "cjk: stop works" ($c_stop.Output -match 'stopped')
+
 } finally {
     if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
 }

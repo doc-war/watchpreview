@@ -183,11 +183,22 @@ func (w *Watcher) executeCompile() bool {
 
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
-		cmd = exec.CommandContext(ctx, "cmd", "/C", w.onChangeCommand)
+		scriptPath, err := writeCmdScript(w.workDir, w.onChangeCommand)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "watchpreview: write onChangeCommand script: %v\n", err)
+			return false
+		}
+		defer os.Remove(scriptPath)
+
+		// cmd 以 workDir 为工作目录，脚本用无空格随机相对文件名传参，
+		// 避免"cmd /C 带引号尾随路径"的解析坑（见 writeCmdScript 注释）。
+		cmd = exec.CommandContext(ctx, "cmd", "/D", "/C", filepath.Base(scriptPath))
+		cmd.Dir = w.workDir
+		hideConsole(cmd)
 	} else {
 		cmd = exec.CommandContext(ctx, "sh", "-c", w.onChangeCommand)
+		cmd.Dir = w.workDir
 	}
-	cmd.Dir = w.workDir
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -195,4 +206,36 @@ func (w *Watcher) executeCompile() bool {
 		return false
 	}
 	return true
+}
+
+// writeCmdScript 把 onChangeCommand 原样写进临时批处理文件（UTF-8 无 BOM）。
+//
+// 为什么不用 `cmd /C <命令>` 直接执行：
+//  1. Go 拼接命令行时会把参数里的 " 转义成 \"（CommandLineToArgvW 算法），
+//     而 cmd.exe 及批处理是 parse 的例外，不认反斜杠引号——任何带引号的
+//     命令串都会碎。Go 官方文档明确建议这种场景自拼 SysProcAttr.CmdLine，
+//     而我们选择更稳的路径：命令行里不出现引号，只有无空格脚本文件名。
+//  2. 命令写进批处理后按行原生解析，引号与中文路径都正确。
+//
+// 码页处理：中文 Windows 上 cmd 默认按 ANSI(GBK) 读批处理文件，UTF-8 写出
+// 的中文路径会乱码。脚本首行放全 ASCII 的 `chcp 65001 >nul`，cmd 从第二行起
+// 按 UTF-8 解析，命令中的中文路径即正确。该两行必须在任何非 ASCII 内容之前。
+func writeCmdScript(dir, command string) (string, error) {
+	tmp, err := os.CreateTemp(dir, ".watchpreview-*.cmd")
+	if err != nil {
+		return "", err
+	}
+	path := tmp.Name()
+
+	content := "@echo off\r\nchcp 65001 >nul\r\n" + command + "\r\n"
+	if _, err := tmp.WriteString(content); err != nil {
+		tmp.Close()
+		os.Remove(path)
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(path)
+		return "", err
+	}
+	return path, nil
 }
