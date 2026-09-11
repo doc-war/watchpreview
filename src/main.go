@@ -21,6 +21,10 @@ func main() {
 	}
 
 	switch os.Args[1] {
+	case "-v", "--version", "version":
+		// version 变量在 cmd_preview.go 中定义，
+		// 发布时由 ldflags 注入真实版本号（如 v1.0.0）。
+		fmt.Println(version)
 	case "preview":
 		runPreviewCommand(os.Args[2:])
 	case "stop":

@@ -1,0 +1,45 @@
+# GoReleaser 配置。
+# 版本 2 语法（goreleaser-action@v6 默认使用 goreleaser v2）。
+version: 2
+
+project_name: watchpreview
+
+# main 包在 src/ 子目录（package main），二进制名为 watchpreview。
+builds:
+  - id: watchpreview
+    main: ./src
+    binary: watchpreview
+    # 静态链接二进制，不允许 cgo，保证在目标机器上直接可运行。
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    # 注入版本号用 main.version（对应代码中的 var version），
+    # -s -w 去掉符号表与 DWARF 减小体积。
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+# 非 Windows 平台用 tar.gz，Windows 用 zip。
+archives:
+  - formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  # Release 标题直接用 tag，例如 v1.0.0。
+  name_template: "v{{.Version}}"
+  # tag 带 -rc / -beta 等 prerelease 后缀时，GoReleaser 依据语义化版本
+  # 自动把该 Release 标记为 Prerelease，无需手动处理。
+  prerelease: auto

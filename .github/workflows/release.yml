@@ -1,0 +1,34 @@
+# 发布：仅当推送 v* 格式的标签时触发。
+# 自动跨平台编译、创建 GitHub Release 并把各平台压缩包挂到资产里。
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# 创建 Release 与上传资产需要写权限。
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # GoReleaser 需要完整 git 历史与所有标签来推导版本与变更。
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --clean
+        env:
+          # 由 GitHub Actions 自动注入，无需手动创建 token。
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

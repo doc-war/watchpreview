@@ -22,6 +22,7 @@ watchpreview preview --root dist
 
 watchpreview status --root dist
 watchpreview stop --root dist
+watchpreview --version                   # 打印版本号（发布版如 v1.0.0，本地构建为 dev）
 ```
 
 对上层框架来说，集成方式就是：
@@ -109,3 +110,38 @@ const url = stdout.split(/\r?\n/).find((l) => l.trim())?.trim(); // 契约：首
 
 - 默认只监听 `127.0.0.1`；`--host 0.0.0.0` 仅用于可信局域网真机预览，且打印的字面 URL 真机不可达，需替换为局域网 IP。
 - 内部机制（陈旧状态降级、HTTP 控制端点、构建、升级）与改动二进制后的回归验证，见根目录 `设计.md`。
+
+---
+
+## 发布流程
+
+仓库通过 Git Tag + GitHub Actions 自动发布，**不需要手动去 GitHub 网页创建 Release**。
+
+**平时开发**（只跑 CI，不产生 Release）：
+
+```bash
+git add .
+git commit -m "feat: xxx"
+git push origin main
+```
+
+CI 会执行 `go test ./...` 与 `go vet ./...`。
+
+**发版**：
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+推送后 GitHub Actions 自动完成：跨平台编译（linux / darwin / windows × amd64 / arm64，`CGO_ENABLED=0` 静态链接）、创建 GitHub Release、挂载各平台压缩包（非 Windows 为 `.tar.gz`，Windows 为 `.zip`）与 `checksums.txt`，Release 标题即为 `v1.0.0`。
+
+> 注意：`git push` **默认不推标签**，必须显式 `git push origin v<tag>` 才会触发发布。
+
+**语义化版本（SemVer）建议**：
+
+- **主版本**：破坏性变更——集成契约变化（stdout/stderr/退出码语义改变）、不向后兼容的行为调整。
+- **次版本**：向后兼容的新增能力（新参数、新子命令、新 fallback 等），旧集成方式无需改动。
+- **修订**：bug 修复、文档、内部实现优化，集成方式不变。
+
+若在开发中打预发布标签（如 `v1.1.0-rc1`），对应 Release 会被**自动标记为 Prerelease**，不会展示为正式版本。

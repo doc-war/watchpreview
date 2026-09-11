@@ -15,7 +15,10 @@ import (
 	"time"
 )
 
-const version = "v1.0.0"
+// version 由发布流程通过 ldflags 注入（.goreleaser.yaml 的
+// -X main.version=<tag>），本地 go build 时为默认值 "dev"。
+// 必须用变量而不是常量：-X 只能注入可变变量的值。
+var version = "dev"
 
 func runPreviewCommand(args []string) {
 	fs := flag.NewFlagSet("preview", flag.ExitOnError)

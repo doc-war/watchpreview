@@ -1,0 +1,23 @@
+# 常规 CI：普通 push 与 pull_request 只跑测试和静态检查，不产生 Release。
+# 发布由 release.yml（推送 v* 标签）单独负责。
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Go test
+        run: go test ./...
+
+      - name: Go vet
+        run: go vet ./...
