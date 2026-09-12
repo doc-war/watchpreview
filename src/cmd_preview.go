@@ -80,6 +80,11 @@ func runPreviewWrapper(cfg *Config, configPath string) {
 		removeInstanceFile(instFile)
 	}
 
+	// 全局并发上限：同用户下所有实例合计 <= maxInstances。
+	// 启动新实例的同时，主动尝试停掉最老的一个（失败也无所谓，
+	// 永不影响下面的 fork）；幂等复用分支不经过这里——复用不新增进程。
+	ensureCapacity()
+
 	selfPath, err := os.Executable()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "watchpreview:", err)
@@ -188,6 +193,7 @@ func runForegroundServer(cfg *Config) {
 		URL:        url,
 		Token:      token,
 		SourceHash: cfg.sourceConfigHash(),
+		StartedAt:  time.Now(),
 	}
 
 	if err := writeInstanceFile(instFile, inst); err != nil {

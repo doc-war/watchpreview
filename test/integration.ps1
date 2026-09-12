@@ -92,6 +92,12 @@ $ignored = Join-Path $src "ignored"
 New-Item -ItemType Directory -Path $live, $src, $cfg, $ignored | Out-Null
 Set-Content -LiteralPath (Join-Path $live "index.html") -Value "<h1>wp21</h1>" -Encoding Ascii
 
+# Isolate the state dir: watchpreview puts <id>.json under %LOCALAPPDATA%.
+# Redirect it into the throwaway work tree so tests never evict/stop any
+# real instance owned by the user (Part 8 starts up to 4 instances on purpose).
+$state = Join-Path $work "state"
+$env:LOCALAPPDATA = $state
+
 # ==== Part 1: explicit --config, static-only (4-step contract) ====
 Write-Host "`n--- Part 1: explicit --config (static-only) ---"
 $cfgPath = Join-Path $cfg "preview.json"
@@ -253,6 +259,71 @@ Set-Content -LiteralPath $trigC -Value "c" -Encoding Ascii
 Assert "cjk: oncompiled command with CJK path triggers marker" (Wait-For -Path $cMarker -TimeoutMs 5000)
 $c_stop = Invoke-WP @("stop", "--config", $cfgC)
 Assert "cjk: stop works" ($c_stop.Output -match 'stopped')
+
+# ==== Part 8: global capacity eviction (max 5 instances) ====
+Write-Host "`n--- Part 8: capacity eviction (max 5 instances) ---"
+foreach ($n in @("A","B","C","D","E","F")) {
+    $d = Join-Path $work ("app" + $n)
+    New-Item -ItemType Directory -Path $d | Out-Null
+    Set-Content -LiteralPath (Join-Path $d "index.html") -Value $n -Encoding Ascii
+}
+$cfgA = Join-Path $cfg "capA.json"
+$cfgB = Join-Path $cfg "capB.json"
+$cfgC = Join-Path $cfg "capC.json"
+$cfgD = Join-Path $cfg "capD.json"
+$cfgE = Join-Path $cfg "capE.json"
+$cfgF = Join-Path $cfg "capF.json"
+Expand-Config -Obj @{ serveRoot = (Join-Path $work "appA") } -Path $cfgA
+Expand-Config -Obj @{ serveRoot = (Join-Path $work "appB") } -Path $cfgB
+Expand-Config -Obj @{ serveRoot = (Join-Path $work "appC") } -Path $cfgC
+Expand-Config -Obj @{ serveRoot = (Join-Path $work "appD") } -Path $cfgD
+Expand-Config -Obj @{ serveRoot = (Join-Path $work "appE") } -Path $cfgE
+Expand-Config -Obj @{ serveRoot = (Join-Path $work "appF") } -Path $cfgF
+
+$e1 = Invoke-WP @("preview","--config",$cfgA)
+Assert "cap: preview A exit 0" ($e1.ExitCode -eq 0)
+$e2 = Invoke-WP @("preview","--config",$cfgB)
+Assert "cap: preview B exit 0" ($e2.ExitCode -eq 0)
+$e3 = Invoke-WP @("preview","--config",$cfgC)
+Assert "cap: preview C exit 0" ($e3.ExitCode -eq 0)
+$e4 = Invoke-WP @("preview","--config",$cfgD)
+Assert "cap: preview D exit 0" ($e4.ExitCode -eq 0)
+$e5 = Invoke-WP @("preview","--config",$cfgE)
+Assert "cap: preview E exit 0" ($e5.ExitCode -eq 0)
+
+# 5 instances: all should be alive, no eviction
+$stateDir = Join-Path $state "watchpreview"
+$cfiles5 = @(Get-ChildItem -LiteralPath $stateDir -Filter *.json -ErrorAction SilentlyContinue)
+Assert "cap: 5 instances running (no eviction)" ($cfiles5.Count -eq 5)
+
+# 6th instance: wrapper evicts oldest (A) before forking F
+$e6 = Invoke-WP @("preview","--config",$cfgF)
+Assert "cap: preview F exit 0" ($e6.ExitCode -eq 0)
+Assert "cap: F single-line http url" (($e6.Lines.Count -eq 1) -and ($e6.Output -match '^http://127\.0\.0\.1:\d+/$'))
+Start-Sleep -Milliseconds 300
+
+# oldest A was evicted
+$deadline = (Get-Date).AddSeconds(5)
+$notRunning = $false
+while ((Get-Date) -lt $deadline) {
+    $sA = Invoke-WP @("status","--config",$cfgA)
+    if ($sA.Output -match 'not running') { $notRunning = $true; break }
+    Start-Sleep -Milliseconds 300
+}
+Assert "cap: oldest A evicted (not running)" $notRunning
+
+# B, C, D, E, F still running (status prints JSON including the url field)
+foreach ($lb in @("B","C","D","E","F")) {
+    $s = Invoke-WP @("status","--config",(Join-Path $cfg ("cap" + $lb + ".json")))
+    Assert "cap: $lb still running" (($s.ExitCode -eq 0) -and ($s.Output.Contains('"url"')))
+}
+
+# exactly 5 instance files remain (A's removed on evict)
+$cfiles = @(Get-ChildItem -LiteralPath $stateDir -Filter *.json -ErrorAction SilentlyContinue)
+Assert "cap: exactly 5 live instance files remain" ($cfiles.Count -eq 5)
+
+# cleanup
+foreach ($cf in @($cfgB,$cfgC,$cfgD,$cfgE,$cfgF)) { Invoke-WP @("stop","--config",$cf) | Out-Null }
 
 } finally {
     if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
